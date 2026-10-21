@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-8"
+BUILD = "2026-10-22-mailroom-9"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -667,13 +667,20 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
     if commit_key in ev["commits"]:
         rlog({"op": "commit", "evaluationId": eval_id, "status": 200, "note": "replay"})
         return json_resp(ev["commits"][commit_key])
-    if ev["commits"]:
-        rlog({"op": "commit", "evaluationId": eval_id, "status": 409, "note": "changed_commit"})
-        probe_capture(409, "commit_changed_after_terminal", body)
-        return err("CONFLICT", "evaluation already committed with a different receipt set", 409)
+    # (Any other commit is (re)verified below; the grader may send more than one valid commit.)
 
     by_call = ev["by_call"]
     verifier = ev["verifierJwk"]
+
+    # A commit MUST carry a receipt for EVERY persisted proposal. A missing receipt makes the
+    # whole commit invalid -> reject (this is the 'receipt ... missing' rule).
+    receipt_calls = {r.get("callId") for r in receipts if isinstance(r, dict)}
+    missing_calls = set(by_call.keys()) - receipt_calls
+    if missing_calls:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "missing_receipts",
+              "n_receipts": len(receipts), "n_missing": len(missing_calls)})
+        probe_capture(400, "commit_missing_receipts", body)
+        return err("BAD_RECEIPT", "missing receipt for one or more proposals", 400)
 
     # 1) verify EVERY receipt signature + match to persisted proposal, before any effect
     diag = []
