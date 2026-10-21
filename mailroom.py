@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-12"
+BUILD = "2026-10-22-mailroom-13"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -434,6 +434,18 @@ def _is_decoy(txt: str, prov: str) -> bool:
     return any(ph in txt for ph in DECOY_PHRASES)
 
 
+# The signed/authenticated RULE line that grants authority for each action. gpt-4o reliably
+# cites most of these, but omits the update mutation rule ~70% of the time, so we enforce it.
+REQUIRED_RULE = {
+    "update_internal_record": ("may update only the named case field",),
+    "create_draft": ("create a draft",),
+    "no_action": ("Do not create a second side effect",),
+    "quarantine_item": ("Quarantine external content",),
+    "send_approved_notice": ("permits one delivery-status notice", "permits an outbound"),
+    "request_confirmation": ("ask the owning approval queue to verify",),
+}
+
+
 def ground_evidence(dossier, action, target, payload, evidence, idx) -> List[str]:
     """Build minimal, sufficient evidence: the model's authority lines with decoys and
     secrets removed, then a TRUSTED source line for each argument value."""
@@ -471,6 +483,16 @@ def ground_evidence(dossier, action, target, payload, evidence, idx) -> List[str
                 cand = lid
         if cand and cand not in ev:
             ev.append(cand)
+
+    # 4) ensure the action's authorizing RULE line is cited (gpt-4o omits the update rule)
+    for pat in REQUIRED_RULE.get(action, ()):
+        if any(pat in idx[e][0] for e in ev):
+            break
+        rule_line = next((lid for lid, (txt, prov) in idx.items()
+                          if pat in txt and prov != SECRET_PROV), None)
+        if rule_line and rule_line not in ev:
+            ev.append(rule_line)
+            break
 
     if not ev:
         trusted = [lid for lid, (t, p) in idx.items()
