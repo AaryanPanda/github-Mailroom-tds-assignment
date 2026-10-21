@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-2"
+BUILD = "2026-10-22-mailroom-3"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -62,7 +62,14 @@ def log(*parts: Any) -> None:
 EVALS: Dict[str, Dict[str, Any]] = {}
 DECISION_CACHE: Dict[str, Dict[str, Any]] = {}   # dossier fingerprint -> decision
 LAST_DEBUG: List[Dict[str, Any]] = []
+REQUEST_LOG: List[Dict[str, Any]] = []           # recent propose/commit request outcomes (debug)
 _lock = asyncio.Lock()
+
+
+def rlog(entry: Dict[str, Any]) -> None:
+    if len(REQUEST_LOG) >= 40:
+        REQUEST_LOG.pop(0)
+    REQUEST_LOG.append(entry)
 
 
 # --------------------------------------------------------------------------- #
@@ -450,7 +457,7 @@ async def debug_last(request: Request):
     token = request.headers.get("x-debug-token") or request.query_params.get("token")
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return err("NOT_FOUND", "Not found", 404)
-    return json_resp({"recent": LAST_DEBUG})
+    return json_resp({"recent": LAST_DEBUG, "requests": REQUEST_LOG})
 
 
 async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
@@ -471,7 +478,9 @@ async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
         prior = EVALS.get(eval_id)
         if prior:
             if prior["inputDigest"] != input_digest:
+                rlog({"op": "propose", "evaluationId": eval_id, "status": 409, "note": "changed_content"})
                 return err("CONFLICT", "evaluationId reused with changed content", 409)
+            rlog({"op": "propose", "evaluationId": eval_id, "status": 200, "note": "replay"})
             return json_resp(prior["response"])  # exact replay, no model work
 
     proposals_map = await decide_dossiers(dossiers, eval_id)
@@ -498,6 +507,8 @@ async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
             "response": response,
             "commits": {},
         }
+    rlog({"op": "propose", "evaluationId": eval_id, "status": 200, "note": "new",
+          "n_dossiers": len(dossiers), "has_verifier": bool(verifier)})
     return json_resp(response)
 
 
@@ -510,39 +521,58 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
 
     ev = EVALS.get(eval_id)
     if not ev:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "unknown_eval"})
         return err("UNKNOWN_EVAL", "unknown evaluation", 400)
     if input_digest != ev["inputDigest"]:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 409, "note": "inputDigest_mismatch",
+              "incoming": input_digest, "stored": ev["inputDigest"]})
         return err("CONFLICT", "inputDigest mismatch", 409)
 
     # exact replay -> stored terminal response, no re-effect
     commit_hash = sha_hex(canonical(body))
     if commit_hash in ev["commits"]:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 200, "note": "replay"})
         return json_resp(ev["commits"][commit_hash])
+    # a DIFFERENT commit for an already-committed evaluation = changed content -> conflict
+    if ev["commits"]:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 409, "note": "changed_commit"})
+        return err("CONFLICT", "evaluation already committed with different content", 409)
 
     by_call = ev["by_call"]
     verifier = ev["verifierJwk"]
 
     # 1) verify EVERY receipt signature + match to persisted proposal, before any effect
+    diag = []
     seen_receipt_ids = set()
     seen_call_ids = set()
     for rc in receipts:
         if not isinstance(rc, dict):
+            rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "malformed_receipt"})
             return err("BAD_RECEIPT", "malformed receipt", 400)
         call_id = rc.get("callId")
         rid = rc.get("receiptId")
-        if call_id in seen_call_ids or rid in seen_receipt_ids:
-            return err("BAD_RECEIPT", "duplicated receipt", 400)
+        dup = call_id in seen_call_ids or rid in seen_receipt_ids
         seen_call_ids.add(call_id)
         seen_receipt_ids.add(rid)
-
         persisted = by_call.get(call_id)
-        if (not persisted or rc.get("dossierId") != persisted["dossierId"]
-                or rc.get("action") != persisted["action"]
-                or rc.get("proposalDigest") != persisted["proposalDigest"]):
-            return err("BAD_RECEIPT", "receipt does not match persisted proposal", 409)
+        binding_ok = bool(persisted and rc.get("dossierId") == persisted["dossierId"]
+                          and rc.get("action") == persisted["action"]
+                          and rc.get("proposalDigest") == persisted["proposalDigest"])
+        sig_ok = verify_receipt(verifier, eval_id, input_digest, rc) if binding_ok else False
+        diag.append({"callId": call_id, "action": rc.get("action"), "accepted": rc.get("accepted"),
+                     "dup": dup, "binding_ok": binding_ok, "sig_ok": sig_ok,
+                     "persisted_digest": (persisted or {}).get("proposalDigest"),
+                     "receipt_digest": rc.get("proposalDigest"),
+                     "has_sig": bool(rc.get("receiptSignature"))})
 
-        if not verify_receipt(verifier, eval_id, input_digest, rc):
-            return err("BAD_RECEIPT", "invalid receipt signature", 400)
+    bad = [d for d in diag if d["dup"] or not d["binding_ok"] or not d["sig_ok"]]
+    if bad:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "rejected_invalid",
+              "n_receipts": len(receipts), "bad": bad[:3]})
+        # schema/binding problems are 400/422; a binding-id mismatch is a 409 conflict
+        only_binding = all((not d["binding_ok"]) and (not d["dup"]) for d in bad) and all(d["has_sig"] for d in bad)
+        return err("BAD_RECEIPT", "invalid or unbound receipt; whole commit rejected",
+                   409 if only_binding else 400)
 
     # 2) all verified -> build outcomes
     outcomes = []
@@ -558,6 +588,9 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
 
     async with _lock:
         ev["commits"][commit_hash] = response
+    rlog({"op": "commit", "evaluationId": eval_id, "status": 200, "note": "completed",
+          "n_receipts": len(receipts),
+          "outcomes": [{"callId": o["callId"], "status": o["status"]} for o in outcomes]})
     return json_resp(response)
 
 
