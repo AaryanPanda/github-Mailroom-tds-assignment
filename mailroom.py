@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-7"
+BUILD = "2026-10-22-mailroom-8"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -655,14 +655,22 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
         probe_capture(409, "commit_inputDigest_mismatch", body)
         return err("CONFLICT", "inputDigest mismatch", 409)
 
-    # exact replay -> stored terminal response, no re-effect
-    commit_hash = sha_hex(canonical(body))
-    if commit_hash in ev["commits"]:
+    # Semantic commit key: the sorted set of receipt identities. An exact OR re-ordered
+    # replay has the same key -> return the stored response (byte-equivalent). A genuinely
+    # DIFFERENT commit after this eval is already committed -> terminal immutability -> 409.
+    commit_key = sha_hex(canonical(sorted(
+        ({"callId": r.get("callId"), "receiptId": r.get("receiptId"),
+          "accepted": r.get("accepted"), "proposalDigest": r.get("proposalDigest"),
+          "dossierId": r.get("dossierId"), "action": r.get("action")}
+         for r in receipts if isinstance(r, dict)),
+        key=lambda x: str(x.get("callId")))))
+    if commit_key in ev["commits"]:
         rlog({"op": "commit", "evaluationId": eval_id, "status": 200, "note": "replay"})
-        return json_resp(ev["commits"][commit_hash])
-    # Otherwise fall through and (re)verify. Verification + outcomes are deterministic, so a
-    # re-serialized/re-ordered replay yields a byte-equivalent response; a tampered commit is
-    # rejected by the binding/signature checks below. (No blanket 409 here.)
+        return json_resp(ev["commits"][commit_key])
+    if ev["commits"]:
+        rlog({"op": "commit", "evaluationId": eval_id, "status": 409, "note": "changed_commit"})
+        probe_capture(409, "commit_changed_after_terminal", body)
+        return err("CONFLICT", "evaluation already committed with a different receipt set", 409)
 
     by_call = ev["by_call"]
     verifier = ev["verifierJwk"]
@@ -712,7 +720,7 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
                 "inputDigest": input_digest, "outcomes": outcomes}
 
     async with _lock:
-        ev["commits"][commit_hash] = response
+        ev["commits"][commit_key] = response
     rlog({"op": "commit", "evaluationId": eval_id, "status": 200, "note": "completed",
           "n_receipts": len(receipts),
           "outcomes": [{"callId": o["callId"], "status": o["status"]} for o in outcomes]})
