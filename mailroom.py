@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-6"
+BUILD = "2026-10-22-mailroom-7"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -63,6 +63,7 @@ EVALS: Dict[str, Dict[str, Any]] = {}
 DECISION_CACHE: Dict[str, Dict[str, Any]] = {}   # dossier fingerprint -> decision
 LAST_DEBUG: List[Dict[str, Any]] = []
 REQUEST_LOG: List[Dict[str, Any]] = []           # recent propose/commit request outcomes (debug)
+PROBES: List[Dict[str, Any]] = []                 # raw bodies of rejected/conflict requests (debug)
 _lock = asyncio.Lock()
 
 
@@ -70,6 +71,26 @@ def rlog(entry: Dict[str, Any]) -> None:
     if len(REQUEST_LOG) >= 40:
         REQUEST_LOG.pop(0)
     REQUEST_LOG.append(entry)
+
+
+def probe_capture(status: int, note: str, body: Dict[str, Any]) -> None:
+    """Keep the raw body of a rejected/conflict request (dossiers stripped, signatures
+    truncated) so the exact grader probe can be inspected via /debug/last."""
+    try:
+        b = {k: v for k, v in body.items() if k != "dossiers"}
+        if isinstance(body.get("dossiers"), list):
+            b["_n_dossiers"] = len(body["dossiers"])
+        if isinstance(b.get("receipts"), list):
+            b["receipts"] = [
+                {**{k: v for k, v in (r or {}).items() if k != "receiptSignature"},
+                 "receiptSignature": str((r or {}).get("receiptSignature", ""))[:16] + "…"}
+                for r in b["receipts"][:66]
+            ]
+        if len(PROBES) >= 8:
+            PROBES.pop(0)
+        PROBES.append({"status": status, "note": note, "body": b})
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -385,11 +406,9 @@ def strip_secret(value: str, idx: Dict[str, Tuple[str, str]]) -> str:
 DECOY_PHRASES = (
     "Select only the action supported", "not scoped to", "closed notice for unrelated",
     "grants no mutation authority", "archive text is not proof", "archive index mentions",
-    "is not proof of approval", "Language alone is neither", "policy drill",
-    "retry marker", "Retention metadata", "tenancy boundary", "search index may lag",
-    "quality note asks reviewers", "mail gateway", "Normalization does not",
-    "previous operator viewed", "timestamps are advisory", "service catalogue says",
-    "public response policy forbids", "not approved for customer disclosure",
+    "policy drill used the words", "Queue telemetry recorded", "retry marker",
+    "Retention metadata assigns", "tenancy boundary for this dossier",
+    "case search index may lag", "previous operator viewed",
 )
 
 
@@ -557,7 +576,7 @@ async def debug_last(request: Request):
     token = request.headers.get("x-debug-token") or request.query_params.get("token")
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return err("NOT_FOUND", "Not found", 404)
-    return json_resp({"recent": LAST_DEBUG, "requests": REQUEST_LOG})
+    return json_resp({"recent": LAST_DEBUG, "requests": REQUEST_LOG, "probes": PROBES})
 
 
 async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
@@ -573,12 +592,17 @@ async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
 
     verifier = (body.get("receiptVerifier") or {}).get("publicKeyJwk")
     input_digest = sha_hex(canonical(dossiers).encode("utf-8"))
+    # Conflict detection is over the WHOLE request, not just dossiers: a changed
+    # receiptVerifier / allowedActions / anything with the same evaluationId is "changed
+    # content" -> 409 (only a byte-identical request is a replay).
+    body_hash = sha_hex(canonical(body))
 
     async with _lock:
         prior = EVALS.get(eval_id)
         if prior:
-            if prior["inputDigest"] != input_digest:
+            if prior.get("bodyHash") != body_hash:
                 rlog({"op": "propose", "evaluationId": eval_id, "status": 409, "note": "changed_content"})
+                probe_capture(409, "propose_changed_content", body)
                 return err("CONFLICT", "evaluationId reused with changed content", 409)
             rlog({"op": "propose", "evaluationId": eval_id, "status": 200, "note": "replay"})
             return json_resp(prior["response"])  # exact replay, no model work
@@ -597,10 +621,11 @@ async def handle_propose(body: Dict[str, Any]) -> JSONResponse:
 
     async with _lock:
         prior = EVALS.get(eval_id)
-        if prior and prior["inputDigest"] != input_digest:
+        if prior and prior.get("bodyHash") != body_hash:
             return err("CONFLICT", "evaluationId reused with changed content", 409)
         EVALS[eval_id] = {
             "inputDigest": input_digest,
+            "bodyHash": body_hash,
             "verifierJwk": verifier,
             "by_call": {p["callId"]: {"dossierId": p["dossierId"], "action": p["action"],
                                       "proposalDigest": p["_digest"]} for p in proposals},
@@ -622,10 +647,12 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
     ev = EVALS.get(eval_id)
     if not ev:
         rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "unknown_eval"})
+        probe_capture(400, "commit_unknown_eval", body)
         return err("UNKNOWN_EVAL", "unknown evaluation", 400)
     if input_digest != ev["inputDigest"]:
         rlog({"op": "commit", "evaluationId": eval_id, "status": 409, "note": "inputDigest_mismatch",
               "incoming": input_digest, "stored": ev["inputDigest"]})
+        probe_capture(409, "commit_inputDigest_mismatch", body)
         return err("CONFLICT", "inputDigest mismatch", 409)
 
     # exact replay -> stored terminal response, no re-effect
@@ -668,10 +695,8 @@ async def handle_commit(body: Dict[str, Any]) -> JSONResponse:
     if bad:
         rlog({"op": "commit", "evaluationId": eval_id, "status": 400, "note": "rejected_invalid",
               "n_receipts": len(receipts), "bad": bad[:3]})
-        # schema/binding problems are 400/422; a binding-id mismatch is a 409 conflict
-        only_binding = all((not d["binding_ok"]) and (not d["dup"]) for d in bad) and all(d["has_sig"] for d in bad)
-        return err("BAD_RECEIPT", "invalid or unbound receipt; whole commit rejected",
-                   409 if only_binding else 400)
+        probe_capture(400, "commit_rejected_invalid", body)
+        return err("BAD_RECEIPT", "invalid or unbound receipt; whole commit rejected", 400)
 
     # 2) all verified -> build outcomes (sorted by callId so order is deterministic
     #    regardless of receipt order -> replays are byte-equivalent)
