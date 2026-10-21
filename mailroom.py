@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 # Config
 # --------------------------------------------------------------------------- #
 PROFILE = "ga5-mailroom-action-gate/v2"
-BUILD = "2026-10-22-mailroom-1"
+BUILD = "2026-10-22-mailroom-2"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -583,11 +583,8 @@ async def dispatch(request: Request) -> JSONResponse:
     return err("SCHEMA", "unknown operation", 400)
 
 
-@app.post("/")
-async def root_post(request: Request):
-    return await dispatch(request)
-
-
-@app.post("/mailroom")
-async def mailroom_post(request: Request):
+@app.post("/{full_path:path}")
+async def any_post(full_path: str, request: Request):
+    # Accept the propose/commit POST on ANY path, so the exact submitted URL
+    # (root, /mailroom, /actions, ...) always reaches the handler.
     return await dispatch(request)
